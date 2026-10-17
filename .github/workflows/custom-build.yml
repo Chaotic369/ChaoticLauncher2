@@ -1,0 +1,148 @@
+name: Custom Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App name (android:label)"
+        required: false
+        default: "Chaotic Launcher"
+      app_version:
+        description: "App version (versionName)"
+        required: false
+        default: "1.0.0"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      APP_NAME: ${{ github.event.inputs.app_name || 'Chaotic Launcher' }}
+      APP_VERSION: ${{ github.event.inputs.app_version || '1.0.0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate Android project
+        id: proj
+        run: |
+          # The project root is the folder that contains app/build.gradle.kts
+          # (repo root, or a sub-folder such as QuickLauncher/).
+          f=$(find . -maxdepth 3 -path '*/app/build.gradle.kts' -not -path './.git/*' | head -n 1)
+          if [ -z "$f" ]; then
+            echo "::error::Could not find app/build.gradle.kts anywhere in the repository"
+            exit 1
+          fi
+          dir=$(dirname "$(dirname "$f")")
+          echo "Android project directory: $dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Patch app name and version
+        env:
+          PROJECT_DIR: ${{ steps.proj.outputs.dir }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          from xml.sax.saxutils import quoteattr
+
+          root = os.environ["PROJECT_DIR"]
+          name = os.environ["APP_NAME"].strip() or "Chaotic Launcher"
+          version = os.environ["APP_VERSION"].strip() or "1.0.0"
+
+          # versionCode: major*10000 + minor*100 + patch (falls back to run number)
+          parts = re.findall(r"\d+", version)
+          if parts:
+              nums = [int(p) for p in parts[:3]] + [0, 0, 0]
+              code = nums[0] * 10000 + nums[1] * 100 + nums[2]
+          else:
+              code = int(os.environ.get("GITHUB_RUN_NUMBER", "1"))
+          code = max(code, 1)
+
+          # --- AndroidManifest.xml: only the <application> label ---
+          mpath = os.path.join(root, "app/src/main/AndroidManifest.xml")
+          with open(mpath, "r", encoding="utf-8") as f:
+              manifest = f.read()
+          app_tag = re.search(r"<application\b[^>]*>", manifest, re.S)
+          if not app_tag:
+              sys.exit("No <application> tag found in " + mpath)
+          tag = app_tag.group(0)
+          label_attr = "android:label=" + quoteattr(name)
+          if re.search(r'android:label\s*=\s*"[^"]*"', tag):
+              new_tag = re.sub(r'android:label\s*=\s*"[^"]*"', lambda m: label_attr, tag, count=1)
+          else:
+              new_tag = tag.replace("<application", "<application " + label_attr, 1)
+          manifest = manifest.replace(tag, new_tag, 1)
+          with open(mpath, "w", encoding="utf-8") as f:
+              f.write(manifest)
+
+          # --- app/build.gradle.kts: versionName / versionCode ---
+          gpath = os.path.join(root, "app/build.gradle.kts")
+          with open(gpath, "r", encoding="utf-8") as f:
+              gradle = f.read()
+          gradle, n1 = re.subn(r'versionName\s*=\s*"[^"]*"', lambda m: 'versionName = "%s"' % version.replace('"', ''), gradle, count=1)
+          gradle, n2 = re.subn(r'versionCode\s*=\s*\d+', lambda m: 'versionCode = %d' % code, gradle, count=1)
+          if n1 == 0 or n2 == 0:
+              sys.exit("versionName/versionCode not found in " + gpath)
+          with open(gpath, "w", encoding="utf-8") as f:
+              f.write(gradle)
+
+          print("Patched name=%r versionName=%r versionCode=%d" % (name, version, code))
+          PY
+
+      - name: Inject launcher icon (if build-icon.png exists)
+        env:
+          PROJECT_DIR: ${{ steps.proj.outputs.dir }}
+        run: |
+          if [ -f build-icon.png ]; then
+            pip install pillow
+            python3 - <<'PY'
+          import os
+          from PIL import Image
+
+          res = os.path.join(os.environ["PROJECT_DIR"], "app/src/main/res")
+          sizes = {
+              "mipmap-mdpi": 48,
+              "mipmap-hdpi": 72,
+              "mipmap-xhdpi": 96,
+              "mipmap-xxhdpi": 144,
+              "mipmap-xxxhdpi": 192,
+          }
+          src = Image.open("build-icon.png").convert("RGBA")
+          for folder, px in sizes.items():
+              out_dir = os.path.join(res, folder)
+              os.makedirs(out_dir, exist_ok=True)
+              img = src.resize((px, px), Image.LANCZOS)
+              img.save(os.path.join(out_dir, "ic_launcher.png"), "PNG")
+              img.save(os.path.join(out_dir, "ic_launcher_round.png"), "PNG")
+          print("Injected build-icon.png into mipmap-* densities")
+          PY
+            # An adaptive icon in mipmap-anydpi-v26 would override the PNGs on API 26+, so remove it
+            rm -f "$PROJECT_DIR/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml"
+            rm -f "$PROJECT_DIR/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml"
+          else
+            echo "build-icon.png not found, keeping existing icon"
+          fi
+
+      - name: Build debug APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.app_name || 'Chaotic Launcher' }}
+          path: ${{ steps.proj.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
